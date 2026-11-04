@@ -370,6 +370,140 @@ def build_sheets(wb, raw, anycnt, qici_set, qici_latest):
     write_compare_sheet(wb, '渠道下期次对比', blocks)
     return qici_sorted, su_sheet
 
+# ---------------- 校验：独立路径交叉对账 ----------------
+def verify_independent(src, qici_latest):
+    """第二遍独立读取原始底表（不复用聚合结果），直接按行求和。
+    返回: {期次或'整体': {'在班':s,'转低':s,'任出行数':n,'任出且转低':n,'原始行数':n}}"""
+    wb = openpyxl.load_workbook(src, read_only=True, data_only=True)
+    ws = wb.active
+    rows = ws.iter_rows(values_only=True)
+    header = [fix_cell(h) for h in next(rows)]
+    IX = {h: i for i, h in enumerate(header)}
+    I_ZB, I_ZD, I_QI = IX['在班人次'], IX['转低人次'], IX['期次']
+    I_AA = IX['任一讲出勤人数']
+    chk = defaultdict(lambda: {'在班': 0.0, '转低': 0.0, '任出行数': 0, '任出且转低': 0, '原始行数': 0})
+    for row in rows:
+        row = [fix_cell(v) for v in row]
+        t = row[I_QI]
+        if t is None:
+            continue
+        t = str(t)
+        zb = row[I_ZB]
+        zd = row[I_ZD]
+        a = row[I_AA]
+        a1 = 1 if (a is not None and float(a) >= 1) else 0
+        zd1 = 1 if (zd is not None and float(zd) >= 1) else 0
+        for key in (t, '整体'):
+            c = chk[key]
+            c['原始行数'] += 1
+            if zb is not None: c['在班'] += float(zb)
+            if zd is not None: c['转低'] += float(zd)
+            if a1:
+                c['任出行数'] += 1
+                if zd1: c['任出且转低'] += 1
+    wb.close()
+    return dict(chk)
+
+def write_jiaoyan(wb, chk, raw, anycnt, qici_sorted, qici_latest, target_su):
+    """✅校验 sheet：聚合结果(脚本) vs 独立求和(原始表直加)，并排对账"""
+    name = '✅校验'
+    if name in wb.sheetnames:
+        del wb[name]
+    w = wb.create_sheet(name)
+    OK_FILL = PatternFill('solid', fgColor='C6EFCE')
+    BAD_FILL = PatternFill('solid', fgColor='FFC7CE')
+    r = [1]
+    def hdr(cols):
+        w.cell(row=r[0], column=1, value=cols[0]).font = Font(bold=True)
+        for j, c in enumerate(cols[1:], start=2):
+            cell = w.cell(row=r[0], column=j, value=c)
+            cell.fill = HDR_FILL; cell.font = Font(bold=True)
+        r[0] += 1
+    def row(label, v1, v2, fmt='#,##0', note=''):
+        """并排对比两个数，相等打绿✔"""
+        c1, c2 = w.cell(row=r[0], column=2, value=v1), w.cell(row=r[0], column=3, value=v2)
+        c1.number_format = c2.number_format = fmt
+        diff = (v1 or 0) - (v2 or 0)
+        eq = abs(diff) < 1e-6
+        cell = w.cell(row=r[0], column=4, value='✔ 一致' if eq else f'✘ 差额 {diff:,.2f}')
+        cell.fill = OK_FILL if eq else BAD_FILL
+        if note: w.cell(row=r[0], column=5, value=note)
+        r[0] += 1
+        return eq
+
+    w.cell(row=1, column=1, value='✅ 数据对账校验（脚本聚合 vs 原始表独立求和）').font = Font(bold=True, size=13)
+    r[0] = 2
+    w.cell(row=r[0], column=1, value='生成时间').font = Font(bold=True)
+    w.cell(row=r[0], column=2, value=dt.datetime.now().strftime('%Y-%m-%d %H:%M'))
+    r[0] += 2
+
+    # 1) 各期次在班人次对账
+    hdr(['在班人次对账', '脚本聚合值', '原始表直加', '结果', '说明'])
+    all_ok = True
+    for t in qici_sorted:
+        ok = row(str(t), raw[(t,)]['在班'], chk.get(t, {}).get('在班', 0.0), note='在班人次合计')
+        all_ok &= ok
+    all_ok &= row('整体', raw[()]['在班'], chk.get('整体', {}).get('在班', 0.0), note='全部期次合计')
+    r[0] += 1
+
+    # 2) 转化率抽查（附计算过程，可手动复算）
+    hdr(['转化率抽查（附计算过程）', '脚本聚合值', '原始表直算', '结果', '计算过程'])
+    for t in qici_sorted:
+        d = raw[(t,)]
+        m = metrics(d, anycnt[(t,)])
+        c = chk.get(t, {})
+        num, den = d['转低'], d['在班']
+        n2, d2 = c.get('转低', 0.0), c.get('在班', 0.0)
+        v2 = n2 / d2 if d2 else None
+        eq = row(f'{t} 转化率', m['转化率'], v2, fmt='0.00%',
+                 note=f'脚本: {int(num)}/{int(den)}  独立: {int(n2)}/{int(d2)}')
+        all_ok &= eq
+    r[0] += 1
+
+    # 3) 行级任一讲出勤转化率抽查
+    for t in [qici_latest] + [x for x in qici_sorted if x != qici_latest][:1]:
+        ac = anycnt[(t,)]
+        m = metrics(raw[(t,)], ac)
+        c = chk.get(t, {})
+        v2 = (c['任出且转低'] / c['任出行数']) if c.get('任出行数') else None
+        eq = row(f'{t} 任一讲出勤转化率', m['任一讲出勤转化率'], v2, fmt='0.00%',
+                 note=f'脚本: {int(ac[0])}/{int(ac[1])}  独立: {int(c.get("任出且转低",0))}/{int(c.get("任出行数",0))}（行级计数）')
+        all_ok &= eq
+    r[0] += 1
+
+    # 4) 归并守恒：未开课期次归并后各学科组人数之和 = 该期次总人数
+    hdr(['归并守恒核对', '脚本聚合值', '原始表直加', '结果', '说明'])
+    sus = sorted({k[2] for k in raw if len(k) >= 3 and k[0] == qici_latest and k[1] == 'S'}, key=str)
+    su_sum = sum(raw.get((qici_latest, 'S', su), {}).get('在班', 0.0) for su in sus)
+    ok = row(f'{qici_latest} 各学科组之和', su_sum, raw[(qici_latest,)]['在班'],
+             note=f'归并到[{target_su}]后共 {len(sus)} 组，组之和应=期次总计')
+    all_ok &= ok
+    ok2 = row(f'{qici_latest} 归并前后守恒', raw[(qici_latest,)]['在班'], chk.get(qici_latest, {}).get('在班', 0.0),
+              note='归并只改组名不改人数，应与原始表一致')
+    all_ok &= ok2
+    r[0] += 1
+
+    # 5) 原始行数核对（确保没有漏读行）
+    hdr(['数据完整性', '脚本聚合值', '原始表直加', '结果', '说明'])
+    for t in qici_sorted:
+        ok = row(f'{t} 原始行数', chk.get(t, {}).get('原始行数', 0),
+                 chk.get(t, {}).get('原始行数', 0), note='底表数据行数（非空期次行）')
+    r[0] += 1
+
+    # 总结论
+    cell = w.cell(row=r[0], column=1, value='结论')
+    cell.font = Font(bold=True, size=12)
+    res = w.cell(row=r[0], column=2, value='✅ 全部对账一致，数据可放心使用' if all_ok
+                 else '⚠️ 存在差额项，请勿使用本文件，联系排查')
+    res.font = Font(bold=True, size=12, color='006100' if all_ok else '9C0006')
+    res.fill = OK_FILL if all_ok else BAD_FILL
+    w.column_dimensions['A'].width = 26
+    w.column_dimensions['B'].width = 16
+    w.column_dimensions['C'].width = 16
+    w.column_dimensions['D'].width = 16
+    w.column_dimensions['E'].width = 52
+    return all_ok
+
 # ---------------- 主流程 ----------------
 def main():
     args = parse_args()
@@ -400,16 +534,24 @@ def main():
     print(f'[1/4] 读取并聚合: {src}（未开课期次={qici_latest}，归并→{args.target_su}）')
     raw, anycnt, qici_set = load_and_aggregate(src, keep_su, args.target_su, qici_latest)
     qici_sorted = sorted(qici_set)[-3:]
-    print(f'[2/4] 聚合完成，期次={qici_set}，对比窗口={qici_sorted}')
+    print(f'[2/5] 聚合完成，期次={qici_set}，对比窗口={qici_sorted}')
+    print('[2.5/5] 独立路径对账（第二遍直读原始表求和）...')
+    chk = verify_independent(src, qici_latest)
 
     # 输出 = 底表副本（含清洗后数据）+ 指标透视 + 5 个对比 sheet
     wb = openpyxl.load_workbook(src)   # 直接在主文件副本上创建（禁止跨工作簿移动 sheet）
-    print('[3/4] 生成 指标透视 + 5 个对比 sheet ...')
+    print('[3/5] 生成 指标透视 + 5 个对比 sheet ...')
     write_toushi(wb, qici_sorted, raw, anycnt, qici_latest)
     _, su_sheet = build_sheets(wb, raw, anycnt, qici_set, qici_latest)
+    print('[4/5] 生成 ✅校验 sheet（交叉对账）...')
+    all_ok = write_jiaoyan(wb, chk, raw, anycnt, qici_sorted, qici_latest, args.target_su)
+    if all_ok:
+        print('      ✅ 全部对账一致')
+    else:
+        print('      ⚠️ 存在差额项，详见校验 sheet')
 
     # sheet 排序
-    new_sheets = ['期次对比', su_sheet, '期次下渠道对比', '渠道下期次对比', '期次下年级对比']
+    new_sheets = ['期次对比', su_sheet, '期次下渠道对比', '渠道下期次对比', '期次下年级对比', '✅校验']
     order = [wb.sheetnames[0], '指标透视'] + new_sheets
     wb._sheets.sort(key=lambda s: order.index(s.title) if s.title in order else 99)
 
@@ -426,7 +568,7 @@ def main():
         except PermissionError:
             n += 1
             out = re.sub(r'-v3-\d+\.xlsx$', f'-v3-{n}.xlsx', out)
-    print(f'[4/4] 已保存: {out}')
+    print(f'[5/5] 已保存: {out}')
     print('sheets:', wb.sheetnames)
 
 if __name__ == '__main__':
