@@ -321,6 +321,27 @@ def build_sheets(wb, raw, anycnt, qici_set, qici_latest):
     add_zhanbi(items, zb_l)
     write_compare_sheet(wb, su_sheet, [(qici_latest, items, False)])
 
+    # 最新期次下学科组内渠道对比（每学科组一块，块内=该组各渠道+总计）
+    su_chan_sheet = f'{qici_latest}学科组内渠道对比'
+    blocks = []
+    for su in sus:
+        d_su = raw.get((qici_latest, 'S', su))
+        if d_su is None or d_su['在班'] == 0: continue
+        zb_su = d_su['在班']
+        chans = sorted({k[2] for k in raw if len(k) >= 5 and k[0] == qici_latest
+                        and k[1] == 'C' and k[3] == 'S' and k[4] == su}, key=str)
+        items = []
+        for ch in chans:
+            d = raw.get((qici_latest, 'C', ch, 'S', su))
+            if d is None or d['在班'] == 0: continue
+            items.append((ch, metrics(d, anycnt[(qici_latest, 'C', ch, 'S', su)])))
+        if not items: continue
+        add_zhanbi(items, zb_su)
+        items.append(('总计', metrics(d_su, anycnt[(qici_latest, 'S', su)])))
+        items[-1][1]['渠道内占比'] = 1.0
+        blocks.append((f'{qici_latest}·{su}', items, True))
+    write_compare_sheet(wb, su_chan_sheet, blocks)
+
     # 期次下渠道对比
     blocks = []
     for t in qici_sorted:
@@ -368,7 +389,7 @@ def build_sheets(wb, raw, anycnt, qici_set, qici_latest):
         items[-1][1]['渠道内占比'] = 1.0
         blocks.append((str(ch), items, True))
     write_compare_sheet(wb, '渠道下期次对比', blocks)
-    return qici_sorted, su_sheet
+    return qici_sorted, su_sheet, su_chan_sheet
 
 # ---------------- 校验：独立路径交叉对账 ----------------
 def verify_independent(src, qici_latest):
@@ -531,7 +552,7 @@ def main():
     wb0.close()
     qici_latest = args.qici or sorted(qici_set0)[-1]
 
-    print(f'[1/4] 读取并聚合: {src}（未开课期次={qici_latest}，归并→{args.target_su}）')
+    print(f'[1/5] 读取并聚合: {src}（未开课期次={qici_latest}，归并→{args.target_su}）')
     raw, anycnt, qici_set = load_and_aggregate(src, keep_su, args.target_su, qici_latest)
     qici_sorted = sorted(qici_set)[-3:]
     print(f'[2/5] 聚合完成，期次={qici_set}，对比窗口={qici_sorted}')
@@ -542,7 +563,7 @@ def main():
     wb = openpyxl.load_workbook(src)   # 直接在主文件副本上创建（禁止跨工作簿移动 sheet）
     print('[3/5] 生成 指标透视 + 5 个对比 sheet ...')
     write_toushi(wb, qici_sorted, raw, anycnt, qici_latest)
-    _, su_sheet = build_sheets(wb, raw, anycnt, qici_set, qici_latest)
+    _, su_sheet, su_chan_sheet = build_sheets(wb, raw, anycnt, qici_set, qici_latest)
     print('[4/5] 生成 ✅校验 sheet（交叉对账）...')
     all_ok = write_jiaoyan(wb, chk, raw, anycnt, qici_sorted, qici_latest, args.target_su)
     if all_ok:
@@ -551,7 +572,7 @@ def main():
         print('      ⚠️ 存在差额项，详见校验 sheet')
 
     # sheet 排序
-    new_sheets = ['期次对比', su_sheet, '期次下渠道对比', '渠道下期次对比', '期次下年级对比', '✅校验']
+    new_sheets = ['期次对比', su_sheet, su_chan_sheet, '期次下渠道对比', '渠道下期次对比', '期次下年级对比', '✅校验']
     order = [wb.sheetnames[0], '指标透视'] + new_sheets
     wb._sheets.sort(key=lambda s: order.index(s.title) if s.title in order else 99)
 
