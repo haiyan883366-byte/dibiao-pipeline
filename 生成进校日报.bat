@@ -33,7 +33,7 @@ echo Output: %OUT%
 echo Running... please wait.
 echo.
 
-python "%SCRIPT%" "%SRC%" "%OUT%"
+python "%SCRIPT%" "%SRC%" "%OUT%" 2>"%TEMP%\dibiao_err.txt"
 if errorlevel 1 goto :fail
 
 echo.
@@ -59,6 +59,15 @@ pause
 exit /b 1
 
 :fail
-echo [ERROR] Script failed. Check messages above.
+echo [ERROR] Script failed. Error details:
+echo ----------------------------------------
+if exist "%TEMP%\dibiao_err.txt" (
+    type "%TEMP%\dibiao_err.txt"
+) else (
+    echo No error detail captured. Try dragging the source file again.
+)
+echo ----------------------------------------
+echo If the message above is in Chinese and garbled, run: chcp 65001
+echo You can also send the source xlsx to WorkBuddy for direct processing.
 pause
 exit /b 1
